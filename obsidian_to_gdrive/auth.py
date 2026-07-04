@@ -31,9 +31,9 @@ def get_google_services(credentials_path: str, token_path: str):
     return docs_service, drive_service
 
 
-def validate_configuration(vault_path: str, credentials_path: str, token_folder: str) -> None:
-    if not os.path.isdir(vault_path):
-        raise FileNotFoundError(f"Vault path not found: {vault_path}")
+def validate_configuration(note_folder_path: str, credentials_path: str, token_folder: str) -> None:
+    if not os.path.isdir(note_folder_path):
+        raise FileNotFoundError(f"Note folder path not found: {note_folder_path}")
     if not os.path.isfile(credentials_path):
         raise FileNotFoundError(f"Credentials file not found: {credentials_path}")
     os.makedirs(token_folder, exist_ok=True)

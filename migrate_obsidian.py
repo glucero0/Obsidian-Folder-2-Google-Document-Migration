@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate Obsidian vault folders to Google Docs with tabs."""
+"""Migrate root-level markdown notes from one folder into a single Google Doc."""
 
 from obsidian_to_gdrive.auth import get_google_services, validate_configuration
 from obsidian_to_gdrive.migrator import run_migration
@@ -7,17 +7,18 @@ from obsidian_to_gdrive.migrator import run_migration
 
 def main() -> None:
     # --- Configuration ---
-    vault_path = r"C:\Users\[username]\ObsidianVaults\Personal"
-    credentials_path = r"C:\Obsidian Migration\[secret].json"
-    token_folder = r"C:\Obsidian Migration\TokenStore"
-    token_path = f"{token_folder}/token.json"
-    drive_migration_folder_name = "Notebooks"
+    note_folder_path = r"C:\path\to\note\folder"
+    google_doc_path = "Folder/Document Name"
 
-    validate_configuration(vault_path, credentials_path, token_folder)
+    credentials_path = r"C:\path\to\credentials\client_secret.json"
+    token_folder = r"C:\path\to\token"
+    token_path = f"{token_folder}/token.json"
+
+    validate_configuration(note_folder_path, credentials_path, token_folder)
 
     print("Initializing Google API Services...")
     docs_service, drive_service = get_google_services(credentials_path, token_path)
-    run_migration(docs_service, drive_service, vault_path, drive_migration_folder_name)
+    run_migration(docs_service, drive_service, note_folder_path, google_doc_path)
 
 
 if __name__ == "__main__":

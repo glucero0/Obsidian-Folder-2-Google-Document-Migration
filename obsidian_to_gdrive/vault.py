@@ -1,53 +1,37 @@
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import SKIPPED_FOLDER_NAMES
+
+def collect_root_markdown_files(note_folder_path: str) -> list[str]:
+    folder = os.path.normpath(note_folder_path)
+    return sorted(
+        [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.lower().endswith(".md") and os.path.isfile(os.path.join(folder, name))
+        ],
+        key=str.lower,
+    )
 
 
-@dataclass(frozen=True)
-class WorkItem:
-    doc_title: str
-    drive_relative_path: str
-    folder_path: str
-    md_files: tuple[str, ...]
-
-
-def should_skip_folder(vault_path: str, folder_path: str) -> bool:
-    relative = os.path.relpath(folder_path, vault_path)
-    if relative in (".", ""):
-        return False
-
-    for segment in Path(relative).parts:
-        if not segment:
-            continue
-        if segment.startswith(".") or segment.lower() in SKIPPED_FOLDER_NAMES:
-            return True
-    return False
-
-
-def enumerate_vault_folders(vault_path: str):
-    yield vault_path
-    for root, dirs, _ in os.walk(vault_path):
-        dirs[:] = [d for d in dirs if not should_skip_folder(vault_path, os.path.join(root, d))]
-        for name in dirs:
-            yield os.path.join(root, name)
-
-
-def get_drive_relative_path(vault_path: str, folder_path: str) -> str:
-    vault_full = os.path.normpath(vault_path)
-    folder_full = os.path.normpath(folder_path)
-    if folder_full.lower() == vault_full.lower():
-        return Path(vault_full).name
-    return os.path.relpath(folder_full, vault_full).replace("\\", "/")
+def find_obsidian_vault_root(note_folder_path: str) -> str:
+    """Walk up from the note folder to find an Obsidian vault root (.obsidian/app.json)."""
+    current = Path(note_folder_path).resolve()
+    while True:
+        if (current / ".obsidian" / "app.json").is_file():
+            return str(current)
+        parent = current.parent
+        if parent == current:
+            return os.path.normpath(note_folder_path)
+        current = parent
 
 
 def split_drive_parent_path(drive_relative_path: str) -> tuple[str, str]:
-    """Split a vault-relative path into (parent_path, leaf_name).
+    """Split a Drive path into (parent_path, leaf_name).
 
-    The leaf name becomes the Google Doc title. Parent folders mirror the vault
-    hierarchy; the doc itself is not placed inside a same-named leaf folder.
+    The leaf name becomes the Google Doc title. Parent folders are created under
+    My Drive; the doc itself is not placed inside a same-named leaf folder.
     """
     normalized = drive_relative_path.replace("\\", "/").strip("/")
     if not normalized:
@@ -56,35 +40,6 @@ def split_drive_parent_path(drive_relative_path: str) -> tuple[str, str]:
     if len(parts) == 1:
         return "", parts[0]
     return "/".join(parts[:-1]), parts[-1]
-
-def collect_folders_with_markdown(vault_path: str) -> list[WorkItem]:
-    vault_full = os.path.normpath(vault_path)
-    work_items: list[WorkItem] = []
-
-    for folder_path in enumerate_vault_folders(vault_full):
-        md_files = sorted(
-            [
-                os.path.join(folder_path, name)
-                for name in os.listdir(folder_path)
-                if name.lower().endswith(".md") and os.path.isfile(os.path.join(folder_path, name))
-            ],
-            key=str.lower,
-        )
-        if not md_files:
-            continue
-
-        drive_relative_path = get_drive_relative_path(vault_full, folder_path)
-        doc_title = Path(folder_path.rstrip(os.sep)).name
-        work_items.append(
-            WorkItem(
-                doc_title=doc_title,
-                drive_relative_path=drive_relative_path,
-                folder_path=folder_path,
-                md_files=tuple(md_files),
-            )
-        )
-
-    return sorted(work_items, key=lambda w: w.drive_relative_path.lower())
 
 
 def make_tab_title(file_path: str) -> str:

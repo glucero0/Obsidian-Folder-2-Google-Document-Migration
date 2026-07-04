@@ -1,8 +1,7 @@
 import os
 import re
-import time
 
-from .constants import MILLISECONDS_BETWEEN_FOLDERS, MIGRATION_ENGINE_VERSION
+from .constants import MIGRATION_ENGINE_VERSION
 from .docs_builder import (
     _find_tab,
     build_markdown_requests_from_blocks,
@@ -14,23 +13,25 @@ from .docs_builder import (
 )
 from .drive_client import (
     UploadedDriveImage,
-    delete_drive_file,
     ensure_doc_images_folder,
-    ensure_drive_folder,
-    ensure_drive_folder_path,
+    ensure_my_drive_folder_path,
     find_drive_doc,
     format_missing_image_text,
-    is_migration_complete,
     materialize_data_uri_image,
     resolve_image_path,
     retry_pending_image_revocations,
-    stamp_migration_complete,
     try_revoke_public_image_access,
     upload_image,
 )
 from .markdown_parser import BlockKind, parse_markdown_blocks, strip_frontmatter
 from .throttle import throttle_and_execute
-from .vault import WorkItem, load_obsidian_attachment_folder, make_tab_title, split_drive_parent_path
+from .vault import (
+    collect_root_markdown_files,
+    find_obsidian_vault_root,
+    load_obsidian_attachment_folder,
+    make_tab_title,
+    split_drive_parent_path,
+)
 
 
 def get_first_tab_id(docs_service, doc_id: str) -> str:
@@ -49,6 +50,23 @@ def get_first_tab_id(docs_service, doc_id: str) -> str:
     if not tab_id:
         raise RuntimeError(f"No tab id returned for document {doc_id}.")
     return tab_id
+
+
+def get_existing_tab_titles(docs_service, doc_id: str) -> set[str]:
+    def _get():
+        return (
+            docs_service.documents()
+            .get(documentId=doc_id, includeTabsContent=True)
+            .execute()
+        )
+
+    doc = throttle_and_execute(_get)
+    titles: set[str] = set()
+    for tab in doc.get("tabs", []):
+        title = tab.get("tabProperties", {}).get("title")
+        if title:
+            titles.add(title)
+    return titles
 
 
 def get_tab_insert_index(docs_service, doc_id: str, tab_id: str) -> int:
@@ -199,7 +217,7 @@ def process_content_and_images(
     doc_id: str,
     content: str,
     note_directory: str,
-    vault_path: str,
+    vault_root: str,
     tab_id: str,
     images_folder_id: str,
     drive_service,
@@ -247,7 +265,7 @@ def process_content_and_images(
                 print(f"  Warning: could not decode embedded image '{alt_text}'")
 
         absolute_img_path = temp_image_path or resolve_image_path(
-            img_ref, note_directory, vault_path, attachment_folder_setting
+            img_ref, note_directory, vault_root, attachment_folder_setting
         )
         uploaded = (
             upload_image(drive_service, absolute_img_path, images_folder_id)
@@ -312,159 +330,6 @@ def process_content_and_images(
         )
 
 
-def process_vault_folder(
-    docs_service,
-    drive_service,
-    migration_root_id: str,
-    work_item: WorkItem,
-    vault_path: str,
-    attachment_folder_setting: str | None = None,
-) -> None:
-    doc_title = work_item.doc_title
-    drive_relative_path = work_item.drive_relative_path
-    folder_path = work_item.folder_path
-    md_files = work_item.md_files
-
-    print(f"\nProcessing folder: '{drive_relative_path}' ({len(md_files)} notes)...")
-
-    parent_path, _leaf_name = split_drive_parent_path(drive_relative_path)
-    parent_folder_id = (
-        ensure_drive_folder_path(drive_service, migration_root_id, parent_path)
-        if parent_path
-        else migration_root_id
-    )
-    images_folder_id = ensure_doc_images_folder(drive_service, parent_folder_id, doc_title)
-
-    existing_doc = find_drive_doc(drive_service, doc_title, parent_folder_id)
-    if existing_doc:
-        if is_migration_complete(existing_doc.description):
-            print(f"  Document '{doc_title}' already migrated [{existing_doc.id}], skipping folder.")
-            return
-        print(
-            f"  Document '{doc_title}' exists but is incomplete [{existing_doc.id}], "
-            "removing and re-migrating."
-        )
-        delete_drive_file(drive_service, existing_doc.id)
-
-    pending_image_revocations: list[UploadedDriveImage] = []
-    doc_id: str | None = None
-
-    try:
-        created = throttle_and_execute(
-            lambda: docs_service.documents().create(body={"title": doc_title}).execute()
-        )
-        doc_id = created["documentId"]
-
-        current = throttle_and_execute(
-            lambda: drive_service.files()
-            .get(fileId=doc_id, fields="parents")
-            .execute()
-        )
-        parents = current.get("parents", [])
-        throttle_and_execute(
-            lambda: drive_service.files()
-            .update(
-                fileId=doc_id,
-                addParents=parent_folder_id,
-                removeParents=",".join(parents),
-                fields="id",
-            )
-            .execute()
-        )
-
-        print(f"  Created master document: '{doc_title}' [ID: {doc_id}]")
-
-        is_first_tab = True
-        migrated_tabs = 0
-        failed_tabs = 0
-
-        for file_path in sorted(md_files, key=str.lower):
-            tab_title = make_tab_title(file_path)
-            print(f"  -> Migrating: {tab_title}")
-
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    raw_content = f.read()
-                clean_content = strip_frontmatter(raw_content)
-                note_directory = os.path.dirname(file_path) or folder_path
-
-                if is_first_tab:
-                    tab_id = get_first_tab_id(docs_service, doc_id)
-                    execute_requests(
-                        docs_service,
-                        doc_id,
-                        [
-                            {
-                                "updateDocumentTabProperties": {
-                                    "tabProperties": {"tabId": tab_id, "title": tab_title},
-                                    "fields": "title",
-                                }
-                            }
-                        ],
-                    )
-                    is_first_tab = False
-                else:
-                    result = execute_requests_with_reply(
-                        docs_service,
-                        doc_id,
-                        [
-                            {
-                                "addDocumentTab": {
-                                    "tabProperties": {"title": tab_title},
-                                }
-                            }
-                        ],
-                    )
-                    tab_id = (
-                        result["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
-                    )
-                    if not tab_id:
-                        raise RuntimeError(f"Failed to create tab for '{tab_title}'.")
-
-                process_content_and_images(
-                    docs_service,
-                    doc_id,
-                    clean_content,
-                    note_directory,
-                    vault_path,
-                    tab_id,
-                    images_folder_id,
-                    drive_service,
-                    pending_image_revocations,
-                    attachment_folder_setting,
-                )
-                migrated_tabs += 1
-            except Exception as exc:
-                failed_tabs += 1
-                print(f"  ERROR migrating '{tab_title}': {exc}")
-
-        if migrated_tabs == 0:
-            raise RuntimeError(
-                f"No tabs migrated for '{drive_relative_path}' ({failed_tabs}/{len(md_files)} failed)."
-            )
-
-        if failed_tabs > 0:
-            print(
-                f"  Warning: {failed_tabs}/{len(md_files)} tab(s) failed for '{drive_relative_path}'. "
-                f"Document [{doc_id}] left unstamped and will be re-migrated on the next run."
-            )
-            return
-
-        stamp_migration_complete(drive_service, doc_id)
-        print(f"  Migration complete for '{doc_title}' ({migrated_tabs} tabs).")
-
-    except Exception as exc:
-        if doc_id:
-            try:
-                delete_drive_file(drive_service, doc_id)
-                print(f"  Removed incomplete document '{doc_title}' [{doc_id}] after failure.")
-            except Exception as delete_exc:
-                print(f"  Warning: could not delete incomplete document '{doc_id}': {delete_exc}")
-        raise RuntimeError(f"Folder '{drive_relative_path}' migration failed: {exc}") from exc
-    finally:
-        retry_pending_image_revocations(drive_service, pending_image_revocations)
-
-
 def execute_requests_with_reply(docs_service, doc_id: str, requests: list[dict]) -> dict:
     return throttle_and_execute(
         lambda: docs_service.documents()
@@ -473,44 +338,172 @@ def execute_requests_with_reply(docs_service, doc_id: str, requests: list[dict])
     )
 
 
+def ensure_google_doc(
+    docs_service,
+    drive_service,
+    doc_title: str,
+    parent_folder_id: str,
+) -> tuple[str, bool]:
+    """Return (document_id, created_new)."""
+    existing_doc = find_drive_doc(drive_service, doc_title, parent_folder_id)
+    if existing_doc:
+        print(f"Using existing document: '{doc_title}' [{existing_doc.id}]")
+        return existing_doc.id, False
+
+    created = throttle_and_execute(
+        lambda: docs_service.documents().create(body={"title": doc_title}).execute()
+    )
+    doc_id = created["documentId"]
+
+    current = throttle_and_execute(
+        lambda: drive_service.files()
+        .get(fileId=doc_id, fields="parents")
+        .execute()
+    )
+    parents = current.get("parents", [])
+    throttle_and_execute(
+        lambda: drive_service.files()
+        .update(
+            fileId=doc_id,
+            addParents=parent_folder_id,
+            removeParents=",".join(parents),
+            fields="id",
+        )
+        .execute()
+    )
+
+    print(f"Created document: '{doc_title}' [ID: {doc_id}]")
+    return doc_id, True
+
+
+def add_tab_for_note(
+    docs_service,
+    doc_id: str,
+    tab_title: str,
+    use_first_tab: bool,
+) -> str:
+    if use_first_tab:
+        tab_id = get_first_tab_id(docs_service, doc_id)
+        execute_requests(
+            docs_service,
+            doc_id,
+            [
+                {
+                    "updateDocumentTabProperties": {
+                        "tabProperties": {"tabId": tab_id, "title": tab_title},
+                        "fields": "title",
+                    }
+                }
+            ],
+        )
+        return tab_id
+
+    result = execute_requests_with_reply(
+        docs_service,
+        doc_id,
+        [
+            {
+                "addDocumentTab": {
+                    "tabProperties": {"title": tab_title},
+                }
+            }
+        ],
+    )
+    tab_id = result["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+    if not tab_id:
+        raise RuntimeError(f"Failed to create tab for '{tab_title}'.")
+    return tab_id
+
+
 def run_migration(
     docs_service,
     drive_service,
-    vault_path: str,
-    drive_migration_folder_name: str,
+    note_folder_path: str,
+    google_doc_path: str,
 ) -> None:
-    from .vault import collect_folders_with_markdown
+    note_folder = os.path.normpath(note_folder_path)
+    md_files = collect_root_markdown_files(note_folder)
+    if not md_files:
+        print("No markdown files found at the root of the note folder.")
+        return
 
-    attachment_folder_setting = load_obsidian_attachment_folder(vault_path)
+    parent_path, doc_title = split_drive_parent_path(google_doc_path)
+    if not doc_title:
+        raise ValueError("google_doc_path must include a document name.")
+
+    parent_folder_id = ensure_my_drive_folder_path(drive_service, parent_path)
+    if parent_path:
+        print(f"Drive parent folder: '{parent_path}' [{parent_folder_id}]")
+    else:
+        print("Drive parent folder: My Drive root")
+
+    vault_root = find_obsidian_vault_root(note_folder)
+    attachment_folder_setting = load_obsidian_attachment_folder(vault_root)
     if attachment_folder_setting:
         print(f"Obsidian attachment folder: '{attachment_folder_setting}'")
 
-    migration_root_id = ensure_drive_folder(drive_service, drive_migration_folder_name, None)
-    print(f"Drive output folder: '{drive_migration_folder_name}' [{migration_root_id}]")
+    doc_id, is_new_doc = ensure_google_doc(
+        docs_service, drive_service, doc_title, parent_folder_id
+    )
+    images_folder_id = ensure_doc_images_folder(drive_service, parent_folder_id, doc_title)
 
-    work_items = collect_folders_with_markdown(vault_path)
-    if not work_items:
-        print("No markdown files found in the vault.")
-        return
+    existing_tab_titles = get_existing_tab_titles(docs_service, doc_id)
+    use_first_tab = is_new_doc
 
-    print(f"Found {len(work_items)} folders with markdown to migrate.")
+    print(
+        f"\nProcessing note folder: '{note_folder}' "
+        f"({len(md_files)} markdown file(s) -> '{google_doc_path}')"
+    )
     print(f"Migration engine version: {MIGRATION_ENGINE_VERSION}")
     print(f"Loaded from: {os.path.dirname(os.path.abspath(__file__))}")
 
-    for i, work_item in enumerate(work_items):
-        try:
-            process_vault_folder(
-                docs_service,
-                drive_service,
-                migration_root_id,
-                work_item,
-                vault_path,
-                attachment_folder_setting,
-            )
-        except Exception as exc:
-            print(f"ERROR processing folder '{work_item.drive_relative_path}': {exc}")
+    pending_image_revocations: list[UploadedDriveImage] = []
+    migrated_tabs = 0
+    skipped_tabs = 0
+    failed_tabs = 0
 
-        if i < len(work_items) - 1:
-            time.sleep(MILLISECONDS_BETWEEN_FOLDERS / 1000.0)
+    try:
+        for file_path in md_files:
+            tab_title = make_tab_title(file_path)
+            if tab_title in existing_tab_titles:
+                print(f"  -> Skipping (tab exists): {tab_title}")
+                skipped_tabs += 1
+                continue
 
-    print("\nMigration complete across all targeted folders.")
+            print(f"  -> Migrating: {tab_title}")
+
+            try:
+                with open(file_path, encoding="utf-8") as f:
+                    raw_content = f.read()
+                clean_content = strip_frontmatter(raw_content)
+                note_directory = os.path.dirname(file_path) or note_folder
+
+                tab_id = add_tab_for_note(
+                    docs_service, doc_id, tab_title, use_first_tab=use_first_tab
+                )
+                use_first_tab = False
+
+                process_content_and_images(
+                    docs_service,
+                    doc_id,
+                    clean_content,
+                    note_directory,
+                    vault_root,
+                    tab_id,
+                    images_folder_id,
+                    drive_service,
+                    pending_image_revocations,
+                    attachment_folder_setting,
+                )
+                existing_tab_titles.add(tab_title)
+                migrated_tabs += 1
+            except Exception as exc:
+                failed_tabs += 1
+                print(f"  ERROR migrating '{tab_title}': {exc}")
+
+        print(
+            f"\nMigration finished: {migrated_tabs} tab(s) added, "
+            f"{skipped_tabs} skipped, {failed_tabs} failed."
+        )
+    finally:
+        retry_pending_image_revocations(drive_service, pending_image_revocations)

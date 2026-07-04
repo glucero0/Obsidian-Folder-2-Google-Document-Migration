@@ -125,6 +125,14 @@ def ensure_drive_folder_path(drive_service, root_parent_id: str, relative_path: 
     return current_parent_id
 
 
+def ensure_my_drive_folder_path(drive_service, relative_path: str) -> str:
+    """Ensure a folder path exists under My Drive and return its folder id."""
+    normalized = relative_path.replace("\\", "/").strip("/")
+    if not normalized:
+        return "root"
+    return ensure_drive_folder_path(drive_service, "root", normalized)
+
+
 def get_image_mime_type(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return SUPPORTED_IMAGE_EXTENSIONS.get(ext)
